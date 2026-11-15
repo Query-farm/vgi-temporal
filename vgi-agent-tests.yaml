@@ -1,0 +1,50 @@
+# Private graders for the public vgi.agent_test_tasks in the worker's catalog metadata.
+# `vgi-lint lint --ai` runs an agent on each prompt and grades it with reference_sql.
+# See https://github.com/Query-farm/vgi-lint-check (VGI920). Every task reads the seeded
+# Temporal dev server (ci/temporal-fixture.sh + test/seeder), so grade with a temporal
+# secret pointing at it, e.g. `ci/temporal-fixture.sh make lint-ai` after
+# CREATE SECRET (TYPE temporal, HOST '<TEMPORAL_FIXTURE_HOST>').
+tasks:
+  - name: failed_workflows
+    reference_sql: >-
+      SELECT workflow_id FROM temporal.main.workflow_executions() WHERE status = 'Failed' ORDER BY workflow_id
+  - name: status_counts
+    reference_sql: >-
+      SELECT status, count FROM temporal.main.count_workflow_executions() ORDER BY status
+  - name: retried_activity
+    reference_sql: >-
+      SELECT s.activity_type, st.attempt
+      FROM temporal.main.workflow_history('order-retry-1') s
+      JOIN temporal.main.workflow_history('order-retry-1') st ON st.scheduled_event_id = s.event_id AND st.event_type = 'ActivityTaskStarted'
+      WHERE s.event_type = 'ActivityTaskScheduled' AND st.attempt > 1
+  - name: gold_customers
+    reference_sql: >-
+      SELECT count(*) AS executions FROM temporal.main.workflow_executions() WHERE CustomerTier = 'gold'
+  - name: stuck_activity
+    reference_sql: >-
+      SELECT activity_type, last_failure_message FROM temporal.main.pending_activities('order-running-1')
+  - name: unified_failures
+    reference_sql: >-
+      SELECT status, count(*) AS runs FROM temporal.unified.runs WHERE status IN ('failed', 'success') GROUP BY status ORDER BY status
+  - name: retried_tasks
+    reference_sql: >-
+      SELECT DISTINCT task_name FROM temporal.unified.task_runs WHERE attempt > 1 ORDER BY task_name
+  - name: namespace_retention
+    reference_sql: >-
+      SELECT retention_days FROM temporal.main.namespaces WHERE name = 'default'
+  - name: paused_schedules
+    reference_sql: >-
+      SELECT schedule_id, workflow_type FROM temporal.main.schedules() WHERE paused ORDER BY schedule_id
+  - name: custom_search_attributes
+    reference_sql: >-
+      SELECT name, type FROM temporal.main.search_attributes() WHERE is_custom ORDER BY name
+  - name: orders_pollers
+    reference_sql: >-
+      SELECT task_queue_type, approximate_backlog_count FROM temporal.main.task_queues('orders') ORDER BY task_queue_type
+  - name: batch_jobs
+    reference_sql: >-
+      SELECT job_id, operation_type, complete_operation_count FROM temporal.main.batch_operations() ORDER BY job_id
+  - name: normalized_failures
+    reference_sql: >-
+      SELECT temporal.main.unified_run_status(status) AS status, count(*) AS executions
+      FROM temporal.main.workflow_executions() GROUP BY ALL ORDER BY status

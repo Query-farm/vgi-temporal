@@ -1,0 +1,472 @@
+# name: test/sql/temporal.test
+# description: SQL tests for the temporal worker against a seeded `temporal server start-dev` (see test/seeder)
+# group: [temporal]
+
+require vgi
+
+require-env TEMPORAL_WORKER
+
+require-env TEMPORAL_FIXTURE_HOST
+
+# The JSON columns and the ->> operator need the json extension.
+statement ok
+LOAD json;
+
+statement ok
+ATTACH 'temporal' (TYPE vgi, LOCATION '{TEMPORAL_WORKER}');
+
+statement ok
+CREATE SECRET temporal_fixture (TYPE temporal, HOST '{TEMPORAL_FIXTURE_HOST}', NAMESPACE 'default', UI_URL 'http://ui.example/');
+
+# ------------------------------------------------------------ workflow_executions
+
+# Custom search attributes become typed columns after the fixed ones.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM temporal.main.workflow_executions())
+WHERE column_name IN ('workflow_id', 'status', 'start_time', 'memo', 'CustomerTier', 'OrderCount') ORDER BY column_name;
+----
+CustomerTier	VARCHAR
+OrderCount	BIGINT
+memo	JSON
+start_time	TIMESTAMP WITH TIME ZONE
+status	VARCHAR
+workflow_id	VARCHAR
+
+query TTTTI
+SELECT workflow_id, workflow_type, status, CustomerTier, OrderCount FROM temporal.main.workflow_executions()
+WHERE scheduled_by_id IS NULL ORDER BY workflow_id;
+----
+batch-target-1	OrderWorkflow	Terminated	NULL	NULL
+o'brien\path-1	OrderWorkflow	Completed	NULL	NULL
+order-failure-1	OrderWorkflow	Failed	silver	1
+order-retry-1	OrderWorkflow	Completed	gold	2
+order-running-1	OrderWorkflow	Running	bronze	5
+order-success-1	OrderWorkflow	Completed	gold	3
+parent-1	ParentWorkflow	Completed	NULL	NULL
+parent-1-child	OrderWorkflow	Completed	NULL	NULL
+
+# Filters below are sent to Temporal as a visibility query and re-applied locally.
+query T
+SELECT workflow_id FROM temporal.main.workflow_executions() WHERE status = 'Failed';
+----
+order-failure-1
+
+query T
+SELECT workflow_id FROM temporal.main.workflow_executions() WHERE status IN ('Running', 'Terminated') ORDER BY 1;
+----
+batch-target-1
+order-running-1
+
+# Statuses are Temporal's spelling; an unknown one is not sent upstream and matches nothing.
+query I
+SELECT count(*) FROM temporal.main.workflow_executions() WHERE status = 'failed';
+----
+0
+
+query T
+SELECT workflow_id FROM temporal.main.workflow_executions() WHERE CustomerTier = 'gold' AND OrderCount >= 3;
+----
+order-success-1
+
+query T
+SELECT workflow_id FROM temporal.main.workflow_executions() WHERE CustomerTier IN ('silver', 'bronze') ORDER BY 1;
+----
+order-failure-1
+order-running-1
+
+query T
+SELECT workflow_id FROM temporal.main.workflow_executions() WHERE close_time IS NULL;
+----
+order-running-1
+
+query T
+SELECT workflow_id FROM temporal.main.workflow_executions() WHERE parent_workflow_id = 'parent-1';
+----
+parent-1-child
+
+query T
+SELECT workflow_id FROM temporal.main.workflow_executions() WHERE root_workflow_id = 'parent-1' AND workflow_type = 'OrderWorkflow';
+----
+parent-1-child
+
+# A quote is escaped; a backslash is filtered locally only (the visibility parser cannot match it).
+query T
+SELECT workflow_id FROM temporal.main.workflow_executions() WHERE workflow_id = 'o''brien\path-1';
+----
+o'brien\path-1
+
+query T
+SELECT workflow_id FROM temporal.main.workflow_executions() WHERE workflow_id IN ('order-success-1', 'o''brien\path-1', 'nope') ORDER BY 1;
+----
+o'brien\path-1
+order-success-1
+
+query I
+SELECT count(*) FROM temporal.main.workflow_executions() WHERE start_time >= TIMESTAMPTZ '2020-01-01 00:00:00+00' AND start_time <= now();
+----
+9
+
+query I
+SELECT count(*) FROM temporal.main.workflow_executions() WHERE start_time < TIMESTAMPTZ '2020-01-01 00:00:00+00';
+----
+0
+
+# An exact timestamp match is pushed as a one-microsecond range.
+query I
+SELECT count(*) FROM temporal.main.workflow_executions() e
+WHERE e.start_time = (SELECT start_time FROM temporal.main.workflow_executions() WHERE workflow_id = 'order-success-1');
+----
+1
+
+query T
+SELECT workflow_id FROM temporal.main.workflow_executions() WHERE workflow_id = 'order-success-1' OR status = 'Running' ORDER BY 1;
+----
+order-running-1
+order-success-1
+
+# Shapes Temporal cannot express (LIKE, functions) are applied by the worker.
+query I
+SELECT count(*) FROM temporal.main.workflow_executions() WHERE workflow_id LIKE 'order-%';
+----
+4
+
+query I
+SELECT count(*) FROM temporal.main.workflow_executions() WHERE history_length > 5 AND lower(workflow_type) = 'parentworkflow';
+----
+1
+
+query I
+SELECT count(*) FROM temporal.main.workflow_executions(query := 'WorkflowId STARTS_WITH ''order-''') WHERE status <> 'Running';
+----
+3
+
+# Pagination: one execution per page, so every page crosses a continuation token.
+query I
+SELECT count(*) FROM temporal.main.workflow_executions(page_size := 1);
+----
+9
+
+query I
+SELECT count(*) FROM (SELECT * FROM temporal.main.workflow_executions(page_size := 2) LIMIT 3);
+----
+3
+
+query I
+SELECT count(*) FROM temporal.main.workflow_executions(namespace := 'analytics');
+----
+0
+
+query T
+SELECT url FROM temporal.main.workflow_executions() WHERE workflow_id = 'order-failure-1';
+----
+<REGEX>:http://ui\.example/namespaces/default/workflows/order-failure-1/[0-9a-f-]+/history
+
+query TII
+SELECT memo IS NULL, json_array_length(json_keys(search_attributes)) >= 2, history_length > 0
+FROM temporal.main.workflow_executions() WHERE workflow_id = 'order-success-1';
+----
+true	1	1
+
+query T
+SELECT scheduled_by_id FROM temporal.main.workflow_executions() WHERE scheduled_by_id = 'nightly-report';
+----
+nightly-report
+
+statement error
+SELECT * FROM temporal.main.workflow_executions(page_size := 0);
+----
+<REGEX>:.*
+
+# ------------------------------------------------------ count_workflow_executions
+
+query TI
+SELECT status, count FROM temporal.main.count_workflow_executions() ORDER BY status;
+----
+Completed	6
+Failed	1
+Running	1
+Terminated	1
+
+query I
+SELECT count FROM temporal.main.count_workflow_executions(query := 'WorkflowType = ''OrderWorkflow''', group_by_status := false);
+----
+8
+
+query TI
+SELECT status, count FROM temporal.main.count_workflow_executions(query := 'CustomerTier = ''gold''');
+----
+Completed	2
+
+# ---------------------------------------------------------------- workflow_history
+
+query ITTII
+SELECT event_id, event_type, activity_type, scheduled_event_id, attempt
+FROM temporal.main.workflow_history('order-retry-1') WHERE event_type LIKE 'Activity%' ORDER BY event_id;
+----
+5	ActivityTaskScheduled	Flaky	NULL	NULL
+6	ActivityTaskStarted	NULL	5	3
+7	ActivityTaskCompleted	NULL	5	NULL
+
+query TT
+SELECT event_type, failure_message FROM temporal.main.workflow_history('order-failure-1') WHERE failure_message IS NOT NULL ORDER BY event_id;
+----
+ActivityTaskFailed	card declined for order-failure-1
+WorkflowExecutionFailed	activity error
+
+query TTT
+SELECT event_type, child_workflow_id, child_workflow_type FROM temporal.main.workflow_history('parent-1')
+WHERE child_workflow_id IS NOT NULL ORDER BY event_id;
+----
+StartChildWorkflowExecutionInitiated	parent-1-child	OrderWorkflow
+ChildWorkflowExecutionStarted	parent-1-child	OrderWorkflow
+ChildWorkflowExecutionCompleted	parent-1-child	OrderWorkflow
+
+# Attributes are JSON with payloads decoded.
+query TT
+SELECT attributes->>'$.input[0]', attributes->>'$.taskQueue.name' FROM temporal.main.workflow_history('order-success-1') WHERE event_id = 1;
+----
+success	orders
+
+query T
+SELECT attributes->>'$.result[0]' FROM temporal.main.workflow_history('order-success-1') WHERE event_type = 'ActivityTaskCompleted';
+----
+charged order-success-1
+
+# run_id defaults to the latest run, and can be given explicitly; paging by 2 events.
+query I
+SELECT count(*) FROM temporal.main.workflow_history('order-success-1', page_size := 2) h
+JOIN temporal.main.workflow_executions() e ON e.workflow_id = h.workflow_id AND e.run_id = h.run_id;
+----
+11
+
+statement ok
+SET VARIABLE success_run = (SELECT run_id FROM temporal.main.workflow_executions() WHERE workflow_id = 'order-success-1');
+
+query I
+SELECT count(*) FROM temporal.main.workflow_history('order-success-1', run_id := getvariable('success_run'));
+----
+11
+
+statement error
+SELECT * FROM temporal.main.workflow_history('no-such-workflow');
+----
+<REGEX>:.*NotFound.*
+
+# ---------------------------------------------------------------- pending_activities
+
+query TTIIT
+SELECT activity_id, activity_type, attempt, maximum_attempts, last_failure_message FROM temporal.main.pending_activities('order-running-1');
+----
+5	AlwaysFail	2	0	warehouse offline for order-running-1
+
+query TT
+SELECT state, next_attempt_schedule_time > now() FROM temporal.main.pending_activities('order-running-1');
+----
+Scheduled	true
+
+query I
+SELECT count(*) FROM temporal.main.pending_activities('order-success-1');
+----
+0
+
+# ------------------------------------------------------------------ operations
+
+query TTT
+SELECT name, state, history_archival_state FROM temporal.main.namespaces WHERE name IN ('default', 'analytics') ORDER BY name;
+----
+analytics	Registered	Disabled
+default	Registered	Disabled
+
+query TTTTTI
+SELECT schedule_id, workflow_type, paused, notes, action_task_queue, action_count FROM temporal.main.schedules();
+----
+nightly-report	OrderWorkflow	true	paused by the fixture	orders	1
+
+# The recorded status of an action is the one seen at start time (Running or Completed).
+query RRITT
+SELECT intervals[1].every_seconds, intervals[1].offset_seconds, len(recent_actions),
+  recent_actions[1].workflow_id LIKE 'nightly-report-run-%', recent_actions[1].status IN ('Running', 'Completed')
+FROM temporal.main.schedules();
+----
+21600.0	0.0	1	true	true
+
+query TT
+SELECT calendars->>'$[0].hour[0].start', overlap_policy FROM temporal.main.schedules();
+----
+3	Skip
+
+query TTI
+SELECT task_queue, task_queue_type, len(pollers) = poller_count::BIGINT FROM temporal.main.task_queues('orders') ORDER BY task_queue_type;
+----
+orders	Activity	1
+orders	Workflow	1
+
+query TT
+SELECT name, type FROM temporal.main.search_attributes() WHERE is_custom ORDER BY name;
+----
+CustomerTier	Keyword
+OrderCount	Int
+
+query TT
+SELECT type, is_custom FROM temporal.main.search_attributes() WHERE name = 'WorkflowId';
+----
+Keyword	false
+
+query TTTIIT
+SELECT job_id, operation_type, state, total_operation_count, complete_operation_count, reason FROM temporal.main.batch_operations();
+----
+terminate-batch-targets	TerminateWorkflow	Completed	1	1	fixture cleanup
+
+# ------------------------------------------------------------ unified_run_status
+
+# The worker's executable example (needs no Temporal connection).
+query TT
+SELECT s, temporal.main.unified_run_status(s) AS status
+FROM (VALUES ('TimedOut'), ('ContinuedAsNew'), ('Canceled'), ('running'), ('WORKFLOW_EXECUTION_STATUS_TERMINATED'), ('bogus')) t(s) ORDER BY s;
+----
+Canceled	cancelled
+ContinuedAsNew	success
+TimedOut	failed
+WORKFLOW_EXECUTION_STATUS_TERMINATED	failed
+bogus	NULL
+running	running
+
+query T
+SELECT temporal.main.unified_run_status(NULL);
+----
+NULL
+
+# It is the mapping unified.runs uses.
+query I
+SELECT count(*) FROM temporal.main.workflow_executions() e JOIN temporal.unified.runs r USING (run_id)
+WHERE temporal.main.unified_run_status(e.status) <> r.status;
+----
+0
+
+# ---------------------------------------------------------------------- unified
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE temporal.unified.runs);
+----
+orchestrator	VARCHAR
+run_id	VARCHAR
+pipeline	VARCHAR
+status	VARCHAR
+raw_status	VARCHAR
+trigger	VARCHAR
+queued_at	TIMESTAMP WITH TIME ZONE
+started_at	TIMESTAMP WITH TIME ZONE
+ended_at	TIMESTAMP WITH TIME ZONE
+duration_seconds	DOUBLE
+url	VARCHAR
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE temporal.unified.task_runs);
+----
+orchestrator	VARCHAR
+run_id	VARCHAR
+task_run_id	VARCHAR
+task_name	VARCHAR
+status	VARCHAR
+raw_status	VARCHAR
+attempt	INTEGER
+started_at	TIMESTAMP WITH TIME ZONE
+ended_at	TIMESTAMP WITH TIME ZONE
+duration_seconds	DOUBLE
+url	VARCHAR
+
+query TTI
+SELECT status, raw_status, count(*) FROM temporal.unified.runs GROUP BY ALL ORDER BY ALL;
+----
+failed	Failed	1
+failed	Terminated	1
+running	Running	1
+success	Completed	6
+
+query TI
+SELECT trigger, count(*) FROM temporal.unified.runs GROUP BY ALL ORDER BY ALL;
+----
+api	7
+other	1
+schedule	1
+
+# Unified statuses push down as sets of Temporal statuses.
+query I
+SELECT count(*) FROM temporal.unified.runs WHERE status = 'failed';
+----
+2
+
+query I
+SELECT count(*) FROM temporal.unified.runs WHERE status <> 'success' AND pipeline = 'OrderWorkflow';
+----
+3
+
+query I
+SELECT count(*) FROM temporal.unified.runs WHERE ended_at IS NULL AND duration_seconds IS NULL;
+----
+1
+
+query I
+SELECT count(*) FROM temporal.unified.runs WHERE started_at >= queued_at AND ended_at >= started_at AND url LIKE 'http://ui.example/%';
+----
+8
+
+query TTITT
+SELECT t.task_name, t.status, t.attempt, t.raw_status, t.run_id = e.run_id
+FROM temporal.unified.task_runs t JOIN temporal.main.workflow_executions() e ON t.run_id = e.run_id
+WHERE e.workflow_id IN ('order-retry-1', 'order-failure-1', 'order-running-1') ORDER BY t.task_name;
+----
+AlwaysFail	queued	2	Scheduled	true
+Decline	failed	1	Failed	true
+Flaky	success	3	Completed	true
+
+# run_id filters push down, so only that run's history is read.
+query TT
+SELECT task_name, task_run_id = run_id || ':5' FROM temporal.unified.task_runs
+WHERE run_id = (SELECT run_id FROM temporal.unified.runs WHERE status = 'failed' AND raw_status = 'Failed');
+----
+Decline	true
+
+query TI
+SELECT status, count(*) FROM temporal.unified.task_runs GROUP BY ALL ORDER BY ALL;
+----
+failed	1
+queued	1
+success	5
+
+query I
+SELECT count(*) FROM temporal.unified.task_runs WHERE status = 'success' AND duration_seconds >= 0 AND ended_at >= started_at;
+----
+5
+
+# The shared shape UNIONs with any other orchestrator worker's unified tables.
+query TI
+SELECT orchestrator, count(*) FROM (
+  SELECT * FROM temporal.unified.runs
+  UNION ALL
+  SELECT 'other', 'r1', 'p', 'success', NULL, NULL, NULL, NULL, NULL, NULL, NULL
+) GROUP BY ALL ORDER BY ALL;
+----
+other	1
+temporal	9
+
+# -------------------------------------------------------------------- secrets
+
+statement ok
+CREATE OR REPLACE SECRET temporal_fixture (TYPE temporal, HOST '{TEMPORAL_FIXTURE_HOST}', TLS 'maybe');
+
+statement error
+SELECT count(*) FROM temporal.main.namespaces;
+----
+<REGEX>:.*TLS must be.*
+
+statement ok
+CREATE OR REPLACE SECRET temporal_fixture (TYPE temporal, HOST '{TEMPORAL_FIXTURE_HOST}', NAMESPACE 'analytics');
+
+query I
+SELECT count(*) FROM temporal.unified.runs;
+----
+0
+
+statement ok
+DROP SECRET temporal_fixture;
