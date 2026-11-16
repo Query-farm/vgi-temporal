@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 (2026-11-16)
+
+- Bump vgi-go to 0.42.2.
+- CI tooling (haybarn-unittest, lint helpers) runs on Python 3.14.
+
 ## 0.1.0 (unreleased)
 
 Initial release: read-only SQL over Temporal (self-hosted and Temporal Cloud) through the gRPC
